@@ -1,0 +1,280 @@
+// ============================================================================
+// Balloon Magic — схема бази даних
+// PostgreSQL + Prisma ORM.
+//
+// Конвенції:
+//  * усі id — рядки (uuid), щоб записи можна було створювати на клієнті
+//    і зливати з кількох пристроїв без конфліктів;
+//  * телефони зберігаються і як введено, і в нормалізованому вигляді
+//    (phoneNormalized) — за ним шукаємо дублі;
+//  * «Налаштування сайту» — це один рядок із фіксованим id = 1.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------- перелічення
+
+enum LeadSource {
+  QUIZ // квіз-воронка
+  CALCULATOR // калькулятор вартості
+  CONTACT // швидка форма в блоці контактів
+  TELEGRAM // перейшов у Telegram
+}
+
+enum LeadStatus {
+  NEW // Новий
+  IN_PROGRESS // В роботі
+  DONE // Виконано
+}
+
+enum HolidayType {
+  BIRTHDAY // День народження
+  KIDS // Дитяче свято
+  GENDER_PARTY // Гендер Паті
+  WEDDING // Весілля
+  CORPORATE // Корпоратив
+  MATERNITY // Виписка з пологового
+}
+
+enum Audience {
+  BOY
+  GIRL
+  MAN
+  WOMAN
+}
+
+enum GuestsRange {
+  UP_TO_10
+  FROM_10_TO_20
+  FROM_20_TO_50
+  OVER_50
+}
+
+enum BudgetRange {
+  UP_TO_1000
+  FROM_1000_TO_3000
+  FROM_3000_TO_5000
+  OVER_5000
+}
+
+enum DecorLevel {
+  ECONOMY // Економ
+  STANDARD // Стандарт
+  PREMIUM // Преміум
+}
+
+enum GalleryCategory {
+  BIRTHDAY
+  WEDDING
+  CORPORATE
+  KIDS
+}
+
+enum TrafficSource {
+  DIRECT
+  TELEGRAM
+  INSTAGRAM
+  GOOGLE
+  FACEBOOK
+  TIKTOK
+  VIBER
+  YOUTUBE
+  REFERRAL
+  OTHER
+}
+
+// ------------------------------------------------------------------ контент
+
+/// Єдиний рядок налаштувань (id = 1). Заповнюється у prisma/seed.ts
+/// і редагується у /admin/settings.
+model SiteSettings {
+  id              Int      @id @default(1)
+  phone           String   @default("+380678873333")
+  telegram        String   @default("party_mode_kiev")
+  instagram       String   @default("party_mode_kiev")
+  address         String   @default("Лісовий проспект, 23Б, Київ, 02000")
+  mapEmbedUrl     String?
+  workingHours    String   @default("Щодня 9:00 – 21:00")
+  discountPercent Int      @default(10)
+  updatedAt       DateTime @updatedAt
+
+  @@map("site_settings")
+}
+
+/// Конфігурація квіз-воронки та ваг калькулятора — один рядок (id = 1).
+///
+/// Навмисно зберігається як JSON-документ, а не як набір таблиць:
+///  · редагується завжди цілком (адміністратор зберігає весь квіз одразу),
+///    тому окремі рядки не дають жодної переваги;
+///  · порядок кроків і варіантів природно лягає в масив — з таблицями
+///    довелося б тримати `sortOrder` і робити кілька запитів на перестановку;
+///  · гарантію форми дає zod-схема (`src/lib/quiz-config.ts`), а не БД.
+///
+/// ⚠️ `data.steps[].options[].value` МУСИТЬ лишатися в межах відповідного
+/// enum'а з цієї ж схеми (`HolidayType`, `Audience`, `GuestsRange`,
+/// `BudgetRange`, `DecorLevel`). Підпис і порядок міняти можна вільно,
+/// а нове значення — лише разом зі зміною enum'а, інакше `prisma.lead.create`
+/// впаде на невалідному enum і заявка не збережеться.
+model QuizConfig {
+  id        Int      @id @default(1)
+  data      Json
+  updatedAt DateTime @updatedAt
+
+  @@map("quiz_config")
+}
+
+/// Готові набори: START / STANDARD / PREMIUM.
+model Package {
+  id          String   @id @default(uuid())
+  slug        String   @unique
+  name        String
+  priceFrom   Int
+  description String
+  features    String[]
+  imageUrl    String?
+  isPopular   Boolean  @default(false)
+  sortOrder   Int      @default(0)
+  isPublished Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([isPublished, sortOrder])
+  @@map("packages")
+}
+
+/// Фотогалерея «Наші роботи» (12 фото з коробки).
+model GalleryItem {
+  id          String          @id @default(uuid())
+  title       String
+  description String?
+  category    GalleryCategory
+  imageUrl    String
+  sortOrder   Int             @default(0)
+  isPublished Boolean         @default(true)
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  @@index([category, sortOrder])
+  @@index([isPublished])
+  @@map("gallery_items")
+}
+
+model Testimonial {
+  id          String   @id @default(uuid())
+  name        String
+  photoUrl    String?
+  text        String
+  rating      Int      @default(5)
+  eventType   String?
+  isPublished Boolean  @default(true)
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([isPublished, sortOrder])
+  @@map("testimonials")
+}
+
+// --------------------------------------------------------------------- CRM
+
+/// Заявка. Джерела: квіз, калькулятор, форма контактів.
+model Lead {
+  id       String     @id @default(uuid())
+  name     String
+  phone    String
+  /// тільки цифри, з 380… — по ньому шукаємо дублі
+  phoneNormalized String
+  source   LeadSource @default(CONTACT)
+  status   LeadStatus @default(NEW)
+
+  // Відповіді квіза / калькулятора
+  holidayType         HolidayType?
+  audience            Audience?
+  guests              GuestsRange?
+  budget              BudgetRange?
+  decorLevel          DecorLevel?
+  delivery            Boolean?
+  eventDate           DateTime?    @db.Date
+  guestsCount         Int?
+  recommendedBalloons Int?
+  estimatedPrice      Int?
+  recommendedPackage  String?
+
+  comment    String?
+  quizAnswers Json?
+  adminNote  String?
+
+  // технічні дані для антиспаму та аналітики
+  visitorId String?
+  ip        String?
+  userAgent String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, createdAt])
+  @@index([createdAt])
+  @@index([source])
+  @@index([phoneNormalized])
+  @@map("leads")
+}
+
+// --------------------------------------------------------------- аналітика
+
+/// Унікальний відвідувач (рік у cookie `bm_vid`).
+model Visitor {
+  id          String        @id @default(uuid())
+  visitorId   String        @unique
+  firstSeenAt DateTime      @default(now())
+  lastSeenAt  DateTime      @default(now())
+  userAgent   String?
+  referrer    String?
+  source      TrafficSource @default(DIRECT)
+  country     String?
+  city        String?
+  pageViews   Int           @default(0)
+
+  @@index([firstSeenAt])
+  @@index([lastSeenAt])
+  @@map("visitors")
+}
+
+/// Перегляд сторінки — основа власного лічильника відвідувань.
+model PageView {
+  id        String        @id @default(uuid())
+  visitorId String
+  /// ідентифікатор сесії (cookie `bm_sid`) — для підрахунку «сеансів»
+  sessionId String
+  path      String
+  referrer  String?
+  source    TrafficSource @default(DIRECT)
+  userAgent String?
+  createdAt DateTime      @default(now())
+
+  @@index([createdAt])
+  @@index([path])
+  @@index([visitorId])
+  @@map("page_views")
+}
+
+/// Довільні події: quiz_view, calculator_open, telegram_click, lead_submit…
+model AnalyticsEvent {
+  id        String   @id @default(uuid())
+  name      String
+  visitorId String?
+  sessionId String?
+  path      String?
+  meta      Json?
+  createdAt DateTime @default(now())
+
+  @@index([name, createdAt])
+  @@index([createdAt])
+  @@map("analytics_events")
+}
